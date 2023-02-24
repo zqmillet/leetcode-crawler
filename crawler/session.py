@@ -1,22 +1,18 @@
 from http import HTTPStatus
-from requests import Session as BaseSession
-from requests.models import Response
-from urllib.parse import unquote
-from json import loads
-from base64 import b64decode
 from time import sleep
+from typing import Optional
+
 from pydantic import BaseModel
 from pydantic import Field
-from typing import Optional
-from typing import List
-from typing import Any
-from zlib import decompress
-from base64 import b64decode
-from json import loads
+from requests import Session as BaseSession
+from requests.models import Response
+from mistletoe import Document
+from mistletoe.block_token import CodeFence
 
-def assert_status_code(response: Response) -> None:
-    if not response.status_code == HTTPStatus.OK:
-        raise ValueError(f'response status is {response.status_code}')
+from .graphql_queries import QUERY_SOLUTIONS
+from .graphql_queries import QUERY_SOLUTION
+from .article_metadata_response import ArticleMetadataResponse
+from .article_response import ArticleResponse
 
 class SubmissionResult(BaseModel):
     status: str = Field(alias='state')
@@ -25,28 +21,39 @@ class SubmissionResult(BaseModel):
     testcase_number: int = Field(alias='total_testcases')
     correct_number: int = Field(alias='total_correct')
 
-    @property
-    def testcases(self) -> List[List[Any]]:
-        return loads(decompress(b64decode(self.output)))
+class SubmissionRequest(BaseModel):
+    submission_id: int
+
+class Solution(BaseModel):
+    language: str
+    code: str
 
 class Session(BaseSession):
     def __init__(self, username: str, password: str, endpoint: str = 'leetcode.cn'):
-        self.username = username
-        self.password = password
-
-        self.login_url = f'https://{endpoint}/accounts/login'
-        self.endpoint = endpoint
         super().__init__()
 
-        response = self.get(self.login_url, verify=False)
-        assert_status_code(response)
+        self.username = username
+        self.password = password
+        self.endpoint = endpoint
 
-        response = self.post(
-            url=self.login_url,
-            data={'login': username, 'password': password},
-            headers={'Referer': self.login_url}
+        self.login()
+
+    def login(self):
+        login_url = f'https://{self.endpoint}/accounts/login'
+        self.get(login_url, verify=False)
+        self.post(
+            url=login_url,
+            data={'login': self.username, 'password': self.password},
+            headers={'Referer': login_url}
         )
-        assert_status_code(response)
+
+    def request(self, *args, **kwargs) -> Response:
+        response = super().request(*args, **kwargs)
+
+        if not response.status_code == HTTPStatus.OK:
+            raise ValueError(f'response status is {response.status_code}: {response.text}')
+
+        return response
 
     def submit(self, question_id, question_slug, code, language) -> int:
         response = self.post(
@@ -63,20 +70,66 @@ class Session(BaseSession):
                 'Referer': f'https://{self.endpoint}/problems/{question_slug}/submissions/',
             }
         )
-        assert_status_code(response)
-        return response.json()['submission_id']
+        return SubmissionRequest.parse_raw(response.text)
 
-    def check(self, submission_id, timeout: int = 10, interval: int = 1) -> SubmissionResult:
+    def get_result(self, submission_id, timeout: int = 10, interval: int = 1) -> SubmissionResult:
         for _ in range(timeout):
-            sleep(1)
+            sleep(interval)
+            response = self.get(url=f'https://{self.endpoint}/submissions/detail/{submission_id}/check/')
 
-            response = self.get(
-                url=f'https://{self.endpoint}/submissions/detail/{submission_id}/check/'
-            )
-            assert_status_code(response)
-            status = response.json()
-
-            if status == 'SUCCESS':
+            if not response.json().get('state') == 'STARTED':
                 break
 
         return SubmissionResult.parse_raw(response.text)
+
+    def get_article_metadata_array(self, question_slug: str, only_official: bool = True):
+        url = f'https://{self.endpoint}/graphql/'
+        response = self.post(
+            url=url,
+            json={
+                "operationName": "questionSolutionVideoArticles",
+                "variables": {
+                    "questionSlug": question_slug,
+                    "userInput": "",
+                    "tagSlugs": [],
+                },
+                'query': QUERY_SOLUTIONS
+            }
+        )
+
+        for metadata in ArticleMetadataResponse.parse_raw(response.text).article_metadata_array:
+            if only_official and not metadata.is_official:
+                continue
+            yield metadata
+
+    def get_articles(self, question_slug: str, only_official: bool = True):
+        url = f'https://{self.endpoint}/graphql/'
+        for metadata in self.get_article_metadata_array(question_slug, only_official):
+            response = self.post(
+                url=url,
+                json={
+                    "operationName": "solutionDetailArticle",
+                    "variables": {
+                        "slug": metadata.slug,
+                        "orderBy": "DEFAULT"
+                    },
+                    'query': QUERY_SOLUTION
+                }
+            )
+            article_response = ArticleResponse.parse_raw(response.text)
+            yield Document(article_response.content)
+
+    def get_solutions(self, question_slug: str, language: Optional[str] = None, only_official: bool = True):
+        for markdown in self.get_articles(question_slug, only_official):
+            for child in markdown.children:
+                if not isinstance(child, CodeFence):
+                    continue
+
+                if language and not child.language == language:
+                    continue
+
+                if not child.children:
+                    continue
+
+                element, *_ = child.children
+                yield Solution(language=child.language, code=element.content)

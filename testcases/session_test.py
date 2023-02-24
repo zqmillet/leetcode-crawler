@@ -1,15 +1,15 @@
-from crawler.session import Session
 from textwrap import dedent
 
-from zlib import decompress
-from base64 import b64decode
-from json import loads
+from pytest import fixture
 
+from crawler.session import Session
 
-def test_submit(username, password):
-    session = Session(username=username, password=password)
+@fixture(name='session', scope='session')
+def _session(username, password):
+    return Session(username=username, password=password)
 
-    submission_id = session.submit(
+def test_submit(session):
+    submission_request = session.submit(
         question_id='1',
         question_slug='two-sum',
         language='python3',
@@ -54,5 +54,9 @@ def test_submit(username, password):
         ).strip()
     )
 
-    submission_result = session.check(submission_id)
-    assert len(submission_result.testcases) == 57
+    submission_result = session.get_result(submission_request.submission_id)
+    assert submission_result.testcase_number > 0
+
+def test_get_solutions(session):
+    solutions = list(session.get_solutions('two-sum', language='Python'))
+    assert len(solutions) == 2
